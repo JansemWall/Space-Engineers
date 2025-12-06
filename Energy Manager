@@ -1,202 +1,231 @@
 // --- CONFIGURAÇÕES --- //
-double MIN_GEL0_KG = 1000;
-float ENERGIA_CRITICA = 0.20f;
-float O2_CRITICO = 0.20f;
-float MIN_H2_TANK = 0.8f; 
-string TAG_ALERTA = "AlertaEnergia";
-string NOME_LCD = "LCD_Energia";
-string TAG_SALA = "[Pressure]";
+const double MIN_GELO_KG = 1000;
+const float ENERGIA_CRITICA = 0.20f;
+const float O2_CRITICO = 0.20f;
+const float MIN_H2_TANK = 0.8f;
+const string TAG_ALERTA = "AlertaEnergia";
+const string NOME_LCD = "LCD_Energia";
+const string TAG_SALA = "[Pressure]";
 
-// --- BLOCOS --- //
-IMyGasGenerator o2Gen;
-List<IMyBatteryBlock> baterias = new List<IMyBatteryBlock>();
-List<IMyPowerProducer> produtores = new List<IMyPowerProducer>();  // Todos produtores de energia
-IMyPowerProducer hydroEngine;
-List<IMyLightingBlock> luzes = new List<IMyLightingBlock>();
-List<IMyGasTank> tanques = new List<IMyGasTank>();
-IMyTextPanel lcd;
-List<IMyAirVent> vents = new List<IMyAirVent>();
-
-// --- Grupos por prioridade --- //
-Dictionary<int, List<IMyTerminalBlock>> gruposDesligamento = new Dictionary<int, List<IMyTerminalBlock>>();
+// --- OBJETOS E DADOS --- //
+IMyGasGenerator _o2Gen;
+IMyPowerProducer _hydroEngine;
+IMyTextPanel _lcd;
+List<IMyBatteryBlock> _baterias = new List<IMyBatteryBlock>();
+List<IMyPowerProducer> _produtores = new List<IMyPowerProducer>();
+List<IMyGasTank> _tanquesH2 = new List<IMyGasTank>();
+List<IMyGasTank> _tanquesO2 = new List<IMyGasTank>();
+List<IMyLightingBlock> _luzesAlerta = new List<IMyLightingBlock>();
+List<RoomMonitor> _salas = new List<RoomMonitor>();
+Dictionary<int, List<IMyFunctionalBlock>> _gruposDesligamento = new Dictionary<int, List<IMyFunctionalBlock>>();
 
 public Program()
 {
     Runtime.UpdateFrequency = UpdateFrequency.Update100;
-
-    o2Gen = GridTerminalSystem.GetBlockWithName("O2/H2 Generator") as IMyGasGenerator;
-    hydroEngine = GridTerminalSystem.GetBlockWithName("Hydrogen Engine") as IMyPowerProducer;
-
-    GridTerminalSystem.GetBlocksOfType(baterias, b => b.IsSameConstructAs(Me));
-    GridTerminalSystem.GetBlocksOfType(produtores, p => p.IsSameConstructAs(Me));
-    GridTerminalSystem.GetBlocksOfType(luzes, l => l.CustomName.Contains(TAG_ALERTA) && l.IsSameConstructAs(Me));
-    GridTerminalSystem.GetBlocksOfType(tanques, b => b.IsSameConstructAs(Me));
-    GridTerminalSystem.GetBlocksOfType(vents, v => v.CustomName.Contains(TAG_SALA) && v.IsSameConstructAs(Me));
-
-    lcd = GridTerminalSystem.GetBlockWithName(NOME_LCD) as IMyTextPanel;
-
-    for (int i = 1; i <= 4; i++)
-    {
-        var grupo = GridTerminalSystem.GetBlockGroupWithName($"Desliga_Nivel{i}");
-        var blocos = new List<IMyTerminalBlock>();
-        if (grupo != null)
-        {
-            grupo.GetBlocks(blocos);
-        }
-        gruposDesligamento[i] = blocos;
-    }
+    InicializarBlocos();
 }
 
 public void Main(string argument, UpdateType updateSource)
 {
-    double geloAtual = (double)o2Gen.GetInventory(0).CurrentMass;
-    float cargaBaterias = (float)baterias.Sum(b => b.CurrentStoredPower);
-    float capacidadeBaterias = (float)baterias.Sum(b => b.MaxStoredPower);
-    float nivelEnergia = (capacidadeBaterias > 0f) ? cargaBaterias / capacidadeBaterias : 0f;
+    // 1. Coleta de Dados
+    double geloAtual = _o2Gen != null ? (double)_o2Gen.GetInventory(0).CurrentMass : 0;
+    float nivelEnergia = CalcularNivelEnergia();
+    double nivelH2 = ObterMediaTanques(_tanquesH2);
+    double nivelO2 = ObterMediaTanques(_tanquesO2);
+    
+    // Monitoramento de Produção
+    double producaoAtual = _produtores.Sum(p => p.CurrentOutput);
+    double producaoMaxima = _produtores.Sum(p => p.MaxOutput);
 
-    double nivelHidrogenio = (double)tanques
-        .Where(t => t.BlockDefinition.SubtypeName.Contains("HydrogenTank"))
-    .Select(t => (double)t.FilledRatio)
-    .DefaultIfEmpty(1f)
-    .Average();
-     double nivelO2 = (double)tanques
-        .Where(t => t.BlockDefinition.SubtypeName.Contains("OxygenTank"))
-    .Select(t => (double)t.FilledRatio)
-    .DefaultIfEmpty(1f)
-    .Average();
+    // 2. Análise de Estado
+    bool isO2Critico = nivelO2 < O2_CRITICO;
+    bool isEnergiaCritica = nivelEnergia < ENERGIA_CRITICA;
+    bool haDespressurizacao = _salas.Any(s => s.IsDespressurizada());
 
-    bool o2Critico =  nivelO2 < O2_CRITICO;
-    bool energiaCritica = nivelEnergia < ENERGIA_CRITICA;
-    bool despressurizado = vents.Any(v => !v.CanPressurize || v.GetOxygenLevel() < 0.8f);
+    bool alertaModerado = isO2Critico || isEnergiaCritica;
+    bool alertaAlto = alertaModerado && haDespressurizacao;
+    bool alertaSevero = isO2Critico && isEnergiaCritica && haDespressurizacao;
 
-    bool alertaModerado = o2Critico || energiaCritica;
-    bool alertaAlto = alertaModerado && despressurizado;
-    bool alertaSevero = o2Critico && energiaCritica && despressurizado;
-
-    // --- Monitoramento de produtores --- //
-    double producaoAtual = (double)produtores.Sum(p => p.CurrentOutput);
-    float producaoMaxima = (float)produtores.Sum(p => p.MaxOutput);
-
-    // --- Controle do motor de hidrogênio --- //
-    bool podeLigarHydro = geloAtual > MIN_GEL0_KG && nivelEnergia < 0.9f && nivelHidrogenio > MIN_H2_TANK;
-    hydroEngine.Enabled = podeLigarHydro;
-
-    // --- Controle dos tanques --- //
-    foreach (var t in tanques)
+    // 3. Execução de Controle
+    GerenciarMotorHidrogenio(geloAtual, nivelEnergia, nivelH2);
+    GerenciarEstoqueTanques(isO2Critico);
+    GerenciarLuzesGerais(alertaModerado, alertaAlto, alertaSevero);
+    GerenciarDesligamentoCarga(alertaModerado, alertaAlto, alertaSevero);
+    
+    foreach (var sala in _salas)
     {
-        t.Stockpile = o2Critico;
+        sala.AtualizarEstado();
     }
 
-    // --- Controle das luzes gerais --- //
-    foreach (var luz in luzes)
-    {
-        if (alertaSevero)
-        {
-            luz.Color = new Color(255, 0, 0);
-            luz.BlinkIntervalSeconds = 0.5f;
-        }
-        else if (alertaAlto)
-        {
-            luz.Color = new Color(255, 100, 0);
-            luz.BlinkIntervalSeconds = 1f;
-        }
-        else if (alertaModerado)
-        {
-            luz.Color = new Color(255, 255, 0);
-            luz.BlinkIntervalSeconds = 2f;
-        }
-        else
-        {
-            luz.Color = new Color(0, 255, 0);
-            luz.BlinkIntervalSeconds = 0f;
-        }
-        luz.Enabled = true;
-    }
-
-    // --- Desligamento por prioridade --- //
-    DesligaSistema(1, alertaModerado || alertaAlto || alertaSevero);
-    DesligaSistema(2, alertaAlto || alertaSevero);
-    DesligaSistema(3, alertaSevero);
-    DesligaSistema(4, alertaSevero);
-
-    // --- Controle de pressão por SALA --- //
-    foreach (var vent in vents)
-    {
-        string salaTag = vent.CustomName;
-        bool salaDespressurizada = !vent.CanPressurize || vent.GetOxygenLevel() < 0.8f;
-
-        var portas = new List<IMyDoor>();
-        var luzesSala = new List<IMyLightingBlock>();
-
-        GridTerminalSystem.GetBlocksOfType(portas, p => p.CustomName.Contains(salaTag) && p.IsSameConstructAs(Me));
-        GridTerminalSystem.GetBlocksOfType(luzesSala, l => l.CustomName.Contains(salaTag) && l.IsSameConstructAs(Me));
-
-        foreach (var porta in portas)
-        {
-            porta.Enabled = !salaDespressurizada;
-            porta.ApplyAction(salaDespressurizada ? "Lock" : "Unlock");
-        }
-
-        foreach (var luz in luzesSala)
-        {
-            if (salaDespressurizada)
-            {
-                luz.Color = new Color(255, 0, 0);
-                luz.BlinkIntervalSeconds = 0.5f;
-            }
-            else
-            {
-                luz.Color = new Color(0, 255, 0);
-                luz.BlinkIntervalSeconds = 0f;
-            }
-            luz.Enabled = true;
-        }
-    }
-
-    // --- LCD --- //
-    if (lcd != null)
-    {
-        lcd.ContentType = ContentType.TEXT_AND_IMAGE;
-        lcd.FontSize = 1.3f;
-
-        string status = $"--- STATUS ---\n" +
-                        $"Gelo: {geloAtual:0.0} kg\n" +
-                        $"Energia: {nivelEnergia:P0}\n" +
-                        $"H2 Tank: {nivelHidrogenio:P8}\n" +
-                        $"Produção: {producaoAtual:0.0} MW / {producaoMaxima:0.0} MW\n" +
-                        $"O2 Tank: {nivelO2:P8}\n" +
-                        $"O2 Crítico: {o2Critico}\n" +
-                        $"Energia Crítica: {energiaCritica}\n" +
-                        $"Despressurização: {despressurizado}\n\n" +
-                        $"Alerta: {(alertaSevero ? "SEVERO" : alertaAlto ? "ALTO" : alertaModerado ? "MODERADO" : "NORMAL")}\n" +
-                        $"Motor H2: {(hydroEngine.Enabled ? "Ligado" : "Desligado")}";
-
-        lcd.WriteText(status);
-    }
-
-    // --- Debug --- //
-    Echo($"Gelo: {geloAtual:0.0} kg\n");
-    Echo($"Energia: {nivelEnergia:P0}\n");
-    Echo($"H2 Tank: {nivelHidrogenio:P8}\n");
-    Echo($"Produção: {producaoAtual:0.0} MW / {producaoMaxima:0.0} MW\n");
-    Echo($"O2 Tank: {nivelO2:P8}\n");
-    Echo($"O2 Crítico: {o2Critico}\n");
-    Echo($"Energia Crítica: {energiaCritica}\n");
-    Echo($"Despressurização: {despressurizado}\n\n");
-    Echo($"Alerta: {(alertaSevero ? "SEVERO" : alertaAlto ? "ALTO" : alertaModerado ? "MODERADO" : "NORMAL")}\n");
-    Echo($"Motor H2: {(hydroEngine.Enabled ? "Ligado" : "Desligado")}");
+    // 4. Exibição
+    AtualizarDisplay(geloAtual, nivelEnergia, nivelH2, nivelO2, producaoAtual, producaoMaxima, 
+                     isO2Critico, isEnergiaCritica, haDespressurizacao, alertaSevero);
 }
 
-void DesligaSistema(int nivel, bool desligar)
-{
-    if (!gruposDesligamento.ContainsKey(nivel)) return;
+// --- MÉTODOS AUXILIARES --- //
 
-    foreach (var bloco in gruposDesligamento[nivel])
+void InicializarBlocos()
+{
+    _o2Gen = GridTerminalSystem.GetBlockWithName("O2/H2 Generator") as IMyGasGenerator;
+    _hydroEngine = GridTerminalSystem.GetBlockWithName("Hydrogen Engine") as IMyPowerProducer;
+    _lcd = GridTerminalSystem.GetBlockWithName(NOME_LCD) as IMyTextPanel;
+
+    GridTerminalSystem.GetBlocksOfType(_baterias, b => b.IsSameConstructAs(Me));
+    GridTerminalSystem.GetBlocksOfType(_produtores, p => p.IsSameConstructAs(Me));
+    GridTerminalSystem.GetBlocksOfType(_luzesAlerta, l => l.CustomName.Contains(TAG_ALERTA) && l.IsSameConstructAs(Me));
+
+    var todosTanques = new List<IMyGasTank>();
+    GridTerminalSystem.GetBlocksOfType(todosTanques, t => t.IsSameConstructAs(Me));
+    foreach(var t in todosTanques)
     {
-        var funcBlock = bloco as IMyFunctionalBlock;
-        if (funcBlock != null)
+        if (t.BlockDefinition.SubtypeName.Contains("HydrogenTank")) _tanquesH2.Add(t);
+        else if (t.BlockDefinition.SubtypeName.Contains("OxygenTank")) _tanquesO2.Add(t);
+    }
+
+    // Mapeamento de Salas (Otimização Crítica)
+    var vents = new List<IMyAirVent>();
+    GridTerminalSystem.GetBlocksOfType(vents, v => v.CustomName.Contains(TAG_SALA) && v.IsSameConstructAs(Me));
+    
+    foreach(var vent in vents)
+    {
+        var portas = new List<IMyDoor>();
+        var luzes = new List<IMyLightingBlock>();
+        // Busca blocos relacionados APENAS na inicialização
+        GridTerminalSystem.GetBlocksOfType(portas, p => p.CustomName.Contains(vent.CustomName) && p.IsSameConstructAs(Me));
+        GridTerminalSystem.GetBlocksOfType(luzes, l => l.CustomName.Contains(vent.CustomName) && l.IsSameConstructAs(Me));
+        _salas.Add(new RoomMonitor(vent, portas, luzes));
+    }
+
+    // Grupos de Desligamento
+    for (int i = 1; i <= 4; i++)
+    {
+        var grupo = GridTerminalSystem.GetBlockGroupWithName($"Desliga_Nivel{i}");
+        var blocos = new List<IMyTerminalBlock>();
+        var funcionais = new List<IMyFunctionalBlock>();
+        
+        if (grupo != null)
         {
-            funcBlock.Enabled = !desligar;
+            grupo.GetBlocks(blocos);
+            foreach(var b in blocos)
+                if(b is IMyFunctionalBlock) funcionais.Add((IMyFunctionalBlock)b);
+        }
+        _gruposDesligamento[i] = funcionais;
+    }
+}
+
+float CalcularNivelEnergia()
+{
+    if (_baterias.Count == 0) return 0f;
+    float carga = _baterias.Sum(b => b.CurrentStoredPower);
+    float max = _baterias.Sum(b => b.MaxStoredPower);
+    return max > 0 ? carga / max : 0f;
+}
+
+double ObterMediaTanques(List<IMyGasTank> lista)
+{
+    if (lista.Count == 0) return 0;
+    return lista.Average(t => t.FilledRatio);
+}
+
+void GerenciarMotorHidrogenio(double gelo, float energia, double h2)
+{
+    if (_hydroEngine == null) return;
+    bool deveLigar = gelo > MIN_GELO_KG && energia < 0.9f && h2 > MIN_H2_TANK;
+    _hydroEngine.Enabled = deveLigar;
+}
+
+void GerenciarEstoqueTanques(bool estocar)
+{
+    foreach (var t in _tanquesO2) t.Stockpile = estocar;
+    foreach (var t in _tanquesH2) t.Stockpile = estocar;
+}
+
+void GerenciarLuzesGerais(bool mod, bool alto, bool severo)
+{
+    Color cor = Color.Green;
+    float blink = 0f;
+
+    if (severo) { cor = Color.Red; blink = 0.5f; }
+    else if (alto) { cor = new Color(255, 100, 0); blink = 1f; }
+    else if (mod) { cor = Color.Yellow; blink = 2f; }
+
+    foreach (var luz in _luzesAlerta)
+    {
+        luz.Enabled = true;
+        luz.Color = cor;
+        luz.BlinkIntervalSeconds = blink;
+    }
+}
+
+void GerenciarDesligamentoCarga(bool mod, bool alto, bool severo)
+{
+    AlternarGrupo(1, !(mod || alto || severo));
+    AlternarGrupo(2, !(alto || severo));
+    AlternarGrupo(3, !severo);
+    AlternarGrupo(4, !severo);
+}
+
+void AlternarGrupo(int nivel, bool ligado)
+{
+    if (!_gruposDesligamento.ContainsKey(nivel)) return;
+    foreach (var b in _gruposDesligamento[nivel]) b.Enabled = ligado;
+}
+
+void AtualizarDisplay(double gelo, float energia, double h2, double o2, double prodAtual, double prodMax,
+                      bool o2Crit, bool enCrit, bool desp, bool severo)
+{
+    string alertaTxt = severo ? "SEVERO" : (desp && enCrit ? "ALTO" : (o2Crit || enCrit ? "MODERADO" : "NORMAL"));
+    string statusEngine = _hydroEngine != null && _hydroEngine.Enabled ? "Ligado" : "Desligado";
+
+    string texto = $"--- STATUS ---\n" +
+                   $"Gelo: {gelo:0.0} kg\n" +
+                   $"Energia: {energia:P0}\n" +
+                   $"H2 Tank: {h2:P1}\n" +
+                   $"Produção: {prodAtual:0.0} / {prodMax:0.0} MW\n" +
+                   $"O2 Tank: {o2:P1}\n" +
+                   $"Alerta: {alertaTxt}\n" +
+                   $"Motor H2: {statusEngine}";
+
+    if (_lcd != null)
+    {
+        _lcd.ContentType = ContentType.TEXT_AND_IMAGE;
+        _lcd.WriteText(texto);
+    }
+    Echo(texto);
+}
+
+// Wrapper para lógica de salas
+class RoomMonitor
+{
+    IMyAirVent _vent;
+    List<IMyDoor> _portas;
+    List<IMyLightingBlock> _luzes;
+
+    public RoomMonitor(IMyAirVent vent, List<IMyDoor> portas, List<IMyLightingBlock> luzes)
+    {
+        _vent = vent;
+        _portas = portas;
+        _luzes = luzes;
+    }
+
+    public bool IsDespressurizada()
+    {
+        return !_vent.CanPressurize || _vent.GetOxygenLevel() < 0.8f;
+    }
+
+    public void AtualizarEstado()
+    {
+        bool problema = IsDespressurizada();
+        foreach (var p in _portas)
+        {
+            p.Enabled = !problema;
+            if (p.Status != DoorStatus.Closed && problema) p.CloseDoor();
+        }
+
+        foreach (var l in _luzes)
+        {
+            l.Color = problema ? Color.Red : Color.Green;
+            l.BlinkIntervalSeconds = problema ? 0.5f : 0f;
         }
     }
 }
