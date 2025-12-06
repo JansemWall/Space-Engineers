@@ -1,13 +1,17 @@
+using VRage.Game.GUI.TextPanel; // Necessário para usar Sprites
+
 // --- CONFIGURAÇÕES --- //
 const double MIN_GELO_KG = 1000;
 const float ENERGIA_CRITICA = 0.20f;
 const float O2_CRITICO = 0.20f;
-const float MIN_H2_TANK = 0.8f;
-const string TAG_ALERTA = "AlertaEnergia";
 const string NOME_LCD = "LCD_Energia";
-const string TAG_SALA = "[Pressure]";
 
-// --- OBJETOS E DADOS --- //
+// Cores do Tema
+Color CorFundo = new Color(20, 20, 20);
+Color CorBarraFundo = new Color(60, 60, 60);
+Color CorTexto = new Color(200, 200, 200);
+
+// --- OBJETOS --- //
 IMyGasGenerator _o2Gen;
 IMyPowerProducer _hydroEngine;
 IMyTextPanel _lcd;
@@ -15,217 +19,162 @@ List<IMyBatteryBlock> _baterias = new List<IMyBatteryBlock>();
 List<IMyPowerProducer> _produtores = new List<IMyPowerProducer>();
 List<IMyGasTank> _tanquesH2 = new List<IMyGasTank>();
 List<IMyGasTank> _tanquesO2 = new List<IMyGasTank>();
-List<IMyLightingBlock> _luzesAlerta = new List<IMyLightingBlock>();
-List<RoomMonitor> _salas = new List<RoomMonitor>();
-Dictionary<int, List<IMyFunctionalBlock>> _gruposDesligamento = new Dictionary<int, List<IMyFunctionalBlock>>();
+
+// Helper de Renderização
+SurfaceRenderer _renderer;
 
 public Program()
 {
     Runtime.UpdateFrequency = UpdateFrequency.Update100;
     InicializarBlocos();
+    
+    // Inicializa o renderizador se o LCD existir
+    if (_lcd != null)
+    {
+        _renderer = new SurfaceRenderer(_lcd);
+    }
 }
 
 public void Main(string argument, UpdateType updateSource)
 {
-    // 1. Coleta de Dados
+    // 1. Coleta (Igual ao anterior, simplificado para focar no visual)
     double geloAtual = _o2Gen != null ? (double)_o2Gen.GetInventory(0).CurrentMass : 0;
     float nivelEnergia = CalcularNivelEnergia();
     double nivelH2 = ObterMediaTanques(_tanquesH2);
     double nivelO2 = ObterMediaTanques(_tanquesO2);
     
-    // Monitoramento de Produção
-    double producaoAtual = _produtores.Sum(p => p.CurrentOutput);
-    double producaoMaxima = _produtores.Sum(p => p.MaxOutput);
-
-    // 2. Análise de Estado
-    bool isO2Critico = nivelO2 < O2_CRITICO;
-    bool isEnergiaCritica = nivelEnergia < ENERGIA_CRITICA;
-    bool haDespressurizacao = _salas.Any(s => s.IsDespressurizada());
-
-    bool alertaModerado = isO2Critico || isEnergiaCritica;
-    bool alertaAlto = alertaModerado && haDespressurizacao;
-    bool alertaSevero = isO2Critico && isEnergiaCritica && haDespressurizacao;
-
-    // 3. Execução de Controle
-    GerenciarMotorHidrogenio(geloAtual, nivelEnergia, nivelH2);
-    GerenciarEstoqueTanques(isO2Critico);
-    GerenciarLuzesGerais(alertaModerado, alertaAlto, alertaSevero);
-    GerenciarDesligamentoCarga(alertaModerado, alertaAlto, alertaSevero);
-    
-    foreach (var sala in _salas)
+    // 2. Lógica (Simplificada aqui)
+    bool motorLigado = false;
+    if (_hydroEngine != null)
     {
-        sala.AtualizarEstado();
+        motorLigado = geloAtual > MIN_GELO_KG && nivelEnergia < 0.9f && nivelH2 > 0.1f;
+        _hydroEngine.Enabled = motorLigado;
     }
 
-    // 4. Exibição
-    AtualizarDisplay(geloAtual, nivelEnergia, nivelH2, nivelO2, producaoAtual, producaoMaxima, 
-                     isO2Critico, isEnergiaCritica, haDespressurizacao, alertaSevero);
+    // 3. Renderização (Onde a mágica acontece)
+    if (_renderer != null)
+    {
+        _renderer.BeginFrame();
+
+        _renderer.DrawHeader("SISTEMA DE SUPORTE");
+
+        // Desenha barras com lógica de cor automática
+        _renderer.DrawProgressBar("Energia Baterias", nivelEnergia, ENERGIA_CRITICA);
+        _renderer.DrawProgressBar("Tanques H2", (float)nivelH2, 0.1f);
+        _renderer.DrawProgressBar("Tanques O2", (float)nivelO2, O2_CRITICO);
+        
+        // Exibe status do Gelo e Motor
+        _renderer.DrawInfoBox($"Gelo: {geloAtual:N0} kg", motorLigado ? "MOTOR: ON" : "MOTOR: OFF", motorLigado ? Color.Green : Color.Gray);
+
+        _renderer.EndFrame();
+    }
 }
 
-// --- MÉTODOS AUXILIARES --- //
-
-void InicializarBlocos()
+// --- CLASSE DE RENDERIZAÇÃO (FRONTEND) --- //
+public class SurfaceRenderer
 {
+    IMyTextSurface _surface;
+    RectangleF _viewport;
+    Vector2 _posAtual;
+    float _padding = 10f;
+
+    public SurfaceRenderer(IMyTextSurface surface)
+    {
+        _surface = surface;
+        // Configura o LCD para modo Sprite (Script)
+        _surface.ContentType = ContentType.SCRIPT;
+        _surface.Script = ""; 
+        _surface.ScriptBackgroundColor = new Color(20, 20, 20); // Fundo escuro
+        
+        // Calcula a área desenhável
+        Vector2 textureSize = _surface.TextureSize;
+        float margin = 20f;
+        _viewport = new RectangleF(
+            (textureSize - _surface.SurfaceSize) / 2f + margin, 
+            _surface.SurfaceSize - (margin * 2)
+        );
+    }
+
+    MySpriteDrawFrame _frame;
+
+    public void BeginFrame()
+    {
+        _frame = _surface.DrawFrame();
+        _posAtual = _viewport.Position; // Reseta o cursor de desenho para o topo
+    }
+
+    public void EndFrame()
+    {
+        _frame.Dispose(); // Envia os comandos para a GPU do jogo
+    }
+
+    public void DrawHeader(string title)
+    {
+        // Desenha texto centralizado
+        var sprite = MySprite.CreateText(title, "Debug", Color.White, 1.2f, TextAlignment.CENTER);
+        sprite.Position = new Vector2(_viewport.Center.X, _posAtual.Y);
+        _frame.Add(sprite);
+        _posAtual.Y += 40f; // Pula linha
+    }
+
+    public void DrawProgressBar(string label, float percentage, float criticalThreshold)
+    {
+        // Configuração visual
+        float barHeight = 30f;
+        float barWidth = _viewport.Width;
+        Color barColor = percentage < criticalThreshold ? Color.Red : (percentage < 0.5f ? Color.Yellow : Color.Green);
+
+        // 1. Texto do Label
+        var labelSprite = MySprite.CreateText($"{label}: {percentage:P0}", "Debug", Color.White, 0.8f, TextAlignment.LEFT);
+        labelSprite.Position = _posAtual;
+        _frame.Add(labelSprite);
+        _posAtual.Y += 25f;
+
+        // 2. Fundo da Barra (Cinza escuro)
+        var bgSprite = new MySprite(SpriteType.TEXTURE, "SquareSimple", size: new Vector2(barWidth, barHeight), color: new Color(50, 50, 50));
+        bgSprite.Position = new Vector2(_viewport.Center.X, _posAtual.Y + barHeight/2);
+        _frame.Add(bgSprite);
+
+        // 3. Preenchimento da Barra (Colorido)
+        float fillWidth = barWidth * MathHelper.Clamp(percentage, 0f, 1f);
+        if (fillWidth > 0)
+        {
+            var fillSprite = new MySprite(SpriteType.TEXTURE, "SquareSimple", size: new Vector2(fillWidth, barHeight), color: barColor);
+            // Posição X = Esquerda da tela + Metade da largura da barra atual
+            fillSprite.Position = new Vector2(_viewport.X + (fillWidth / 2), _posAtual.Y + barHeight/2);
+            _frame.Add(fillSprite);
+        }
+
+        _posAtual.Y += barHeight + _padding; // Pula para o próximo elemento
+    }
+
+    public void DrawInfoBox(string textLeft, string textRight, Color statusColor)
+    {
+        _posAtual.Y += 10f;
+        var spriteLeft = MySprite.CreateText(textLeft, "Debug", Color.White, 0.8f, TextAlignment.LEFT);
+        spriteLeft.Position = new Vector2(_viewport.X, _posAtual.Y);
+        _frame.Add(spriteLeft);
+
+        var spriteRight = MySprite.CreateText(textRight, "Debug", statusColor, 0.8f, TextAlignment.RIGHT);
+        spriteRight.Position = new Vector2(_viewport.X + _viewport.Width, _posAtual.Y);
+        _frame.Add(spriteRight);
+    }
+}
+
+// --- MÉTODOS DE SUPORTE --- //
+void InicializarBlocos() {
     _o2Gen = GridTerminalSystem.GetBlockWithName("O2/H2 Generator") as IMyGasGenerator;
     _hydroEngine = GridTerminalSystem.GetBlockWithName("Hydrogen Engine") as IMyPowerProducer;
     _lcd = GridTerminalSystem.GetBlockWithName(NOME_LCD) as IMyTextPanel;
-
     GridTerminalSystem.GetBlocksOfType(_baterias, b => b.IsSameConstructAs(Me));
-    GridTerminalSystem.GetBlocksOfType(_produtores, p => p.IsSameConstructAs(Me));
-    GridTerminalSystem.GetBlocksOfType(_luzesAlerta, l => l.CustomName.Contains(TAG_ALERTA) && l.IsSameConstructAs(Me));
-
-    var todosTanques = new List<IMyGasTank>();
-    GridTerminalSystem.GetBlocksOfType(todosTanques, t => t.IsSameConstructAs(Me));
-    foreach(var t in todosTanques)
-    {
-        if (t.BlockDefinition.SubtypeName.Contains("HydrogenTank")) _tanquesH2.Add(t);
-        else if (t.BlockDefinition.SubtypeName.Contains("OxygenTank")) _tanquesO2.Add(t);
-    }
-
-    // Mapeamento de Salas (Otimização Crítica)
-    var vents = new List<IMyAirVent>();
-    GridTerminalSystem.GetBlocksOfType(vents, v => v.CustomName.Contains(TAG_SALA) && v.IsSameConstructAs(Me));
-    
-    foreach(var vent in vents)
-    {
-        var portas = new List<IMyDoor>();
-        var luzes = new List<IMyLightingBlock>();
-        // Busca blocos relacionados APENAS na inicialização
-        GridTerminalSystem.GetBlocksOfType(portas, p => p.CustomName.Contains(vent.CustomName) && p.IsSameConstructAs(Me));
-        GridTerminalSystem.GetBlocksOfType(luzes, l => l.CustomName.Contains(vent.CustomName) && l.IsSameConstructAs(Me));
-        _salas.Add(new RoomMonitor(vent, portas, luzes));
-    }
-
-    // Grupos de Desligamento
-    for (int i = 1; i <= 4; i++)
-    {
-        var grupo = GridTerminalSystem.GetBlockGroupWithName($"Desliga_Nivel{i}");
-        var blocos = new List<IMyTerminalBlock>();
-        var funcionais = new List<IMyFunctionalBlock>();
-        
-        if (grupo != null)
-        {
-            grupo.GetBlocks(blocos);
-            foreach(var b in blocos)
-                if(b is IMyFunctionalBlock) funcionais.Add((IMyFunctionalBlock)b);
-        }
-        _gruposDesligamento[i] = funcionais;
-    }
+    GridTerminalSystem.GetBlocksOfType(_tanquesH2, t => t.IsSameConstructAs(Me) && t.BlockDefinition.SubtypeName.Contains("HydrogenTank"));
+    GridTerminalSystem.GetBlocksOfType(_tanquesO2, t => t.IsSameConstructAs(Me) && t.BlockDefinition.SubtypeName.Contains("OxygenTank"));
 }
-
-float CalcularNivelEnergia()
-{
+float CalcularNivelEnergia() {
     if (_baterias.Count == 0) return 0f;
-    float carga = _baterias.Sum(b => b.CurrentStoredPower);
-    float max = _baterias.Sum(b => b.MaxStoredPower);
-    return max > 0 ? carga / max : 0f;
+    return _baterias.Sum(b => b.CurrentStoredPower) / _baterias.Sum(b => b.MaxStoredPower);
 }
-
-double ObterMediaTanques(List<IMyGasTank> lista)
-{
-    if (lista.Count == 0) return 0;
-    return lista.Average(t => t.FilledRatio);
-}
-
-void GerenciarMotorHidrogenio(double gelo, float energia, double h2)
-{
-    if (_hydroEngine == null) return;
-    bool deveLigar = gelo > MIN_GELO_KG && energia < 0.9f && h2 > MIN_H2_TANK;
-    _hydroEngine.Enabled = deveLigar;
-}
-
-void GerenciarEstoqueTanques(bool estocar)
-{
-    foreach (var t in _tanquesO2) t.Stockpile = estocar;
-    foreach (var t in _tanquesH2) t.Stockpile = estocar;
-}
-
-void GerenciarLuzesGerais(bool mod, bool alto, bool severo)
-{
-    Color cor = Color.Green;
-    float blink = 0f;
-
-    if (severo) { cor = Color.Red; blink = 0.5f; }
-    else if (alto) { cor = new Color(255, 100, 0); blink = 1f; }
-    else if (mod) { cor = Color.Yellow; blink = 2f; }
-
-    foreach (var luz in _luzesAlerta)
-    {
-        luz.Enabled = true;
-        luz.Color = cor;
-        luz.BlinkIntervalSeconds = blink;
-    }
-}
-
-void GerenciarDesligamentoCarga(bool mod, bool alto, bool severo)
-{
-    AlternarGrupo(1, !(mod || alto || severo));
-    AlternarGrupo(2, !(alto || severo));
-    AlternarGrupo(3, !severo);
-    AlternarGrupo(4, !severo);
-}
-
-void AlternarGrupo(int nivel, bool ligado)
-{
-    if (!_gruposDesligamento.ContainsKey(nivel)) return;
-    foreach (var b in _gruposDesligamento[nivel]) b.Enabled = ligado;
-}
-
-void AtualizarDisplay(double gelo, float energia, double h2, double o2, double prodAtual, double prodMax,
-                      bool o2Crit, bool enCrit, bool desp, bool severo)
-{
-    string alertaTxt = severo ? "SEVERO" : (desp && enCrit ? "ALTO" : (o2Crit || enCrit ? "MODERADO" : "NORMAL"));
-    string statusEngine = _hydroEngine != null && _hydroEngine.Enabled ? "Ligado" : "Desligado";
-
-    string texto = $"--- STATUS ---\n" +
-                   $"Gelo: {gelo:0.0} kg\n" +
-                   $"Energia: {energia:P0}\n" +
-                   $"H2 Tank: {h2:P1}\n" +
-                   $"Produção: {prodAtual:0.0} / {prodMax:0.0} MW\n" +
-                   $"O2 Tank: {o2:P1}\n" +
-                   $"Alerta: {alertaTxt}\n" +
-                   $"Motor H2: {statusEngine}";
-
-    if (_lcd != null)
-    {
-        _lcd.ContentType = ContentType.TEXT_AND_IMAGE;
-        _lcd.WriteText(texto);
-    }
-    Echo(texto);
-}
-
-// Wrapper para lógica de salas
-class RoomMonitor
-{
-    IMyAirVent _vent;
-    List<IMyDoor> _portas;
-    List<IMyLightingBlock> _luzes;
-
-    public RoomMonitor(IMyAirVent vent, List<IMyDoor> portas, List<IMyLightingBlock> luzes)
-    {
-        _vent = vent;
-        _portas = portas;
-        _luzes = luzes;
-    }
-
-    public bool IsDespressurizada()
-    {
-        return !_vent.CanPressurize || _vent.GetOxygenLevel() < 0.8f;
-    }
-
-    public void AtualizarEstado()
-    {
-        bool problema = IsDespressurizada();
-        foreach (var p in _portas)
-        {
-            p.Enabled = !problema;
-            if (p.Status != DoorStatus.Closed && problema) p.CloseDoor();
-        }
-
-        foreach (var l in _luzes)
-        {
-            l.Color = problema ? Color.Red : Color.Green;
-            l.BlinkIntervalSeconds = problema ? 0.5f : 0f;
-        }
-    }
+double ObterMediaTanques(List<IMyGasTank> l) {
+    if (l.Count == 0) return 0;
+    return l.Average(t => (double)t.FilledRatio);
 }
